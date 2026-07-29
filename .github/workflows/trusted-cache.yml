@@ -1,0 +1,146 @@
+name: trusted-cache-boundary
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: seed or verify
+        required: true
+        default: seed
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  trusted:
+    runs-on: [self-hosted, cp-fork-boundary-20260729]
+    steps:
+      - name: Create trusted base-branch cache canary
+        if: inputs.mode == 'seed'
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s\n' 'ACTIONS_CP_TRUSTED_BASE_CACHE_20260729_758a95f093' > base-cache-marker.txt
+
+      - name: Save trusted base-branch cache canary
+        if: inputs.mode == 'seed'
+        uses: actions/cache/save@v4
+        with:
+          path: base-cache-marker.txt
+          key: actions-cp-trusted-base-cache-20260729-v1
+
+      - name: Restore standard fork cache from trusted main
+        if: inputs.mode == 'verify'
+        id: standard
+        uses: actions/cache/restore@v4
+        with:
+          path: fork-standard-marker.txt
+          key: actions-cp-fork-standard-poison-20260729-v1
+          lookup-only: true
+
+      - name: Restore raw fork control cache from trusted main
+        if: inputs.mode == 'verify'
+        id: raw-control
+        uses: actions/cache/restore@v4
+        with:
+          path: fork-raw-marker.txt
+          key: actions-cp-fork-raw-control-20260729-v1
+          lookup-only: true
+
+      - name: Restore raw forged-base cache from trusted main
+        if: inputs.mode == 'verify'
+        id: raw-forged
+        uses: actions/cache/restore@v4
+        with:
+          path: fork-raw-marker.txt
+          key: actions-cp-fork-raw-base-forged-20260729-v1
+          lookup-only: true
+
+      - name: Restore raw mixed-scope cache from trusted main
+        if: inputs.mode == 'verify'
+        id: raw-mixed
+        uses: actions/cache/restore@v4
+        with:
+          path: fork-raw-marker.txt
+          key: actions-cp-fork-raw-mixed-forged-20260729-v1
+          lookup-only: true
+
+      - name: Download standard fork cache proof
+        if: inputs.mode == 'verify' && steps.standard.outputs.cache-hit == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: fork-standard-marker.txt
+          key: actions-cp-fork-standard-poison-20260729-v1
+
+      - name: Record standard fork cache proof
+        if: inputs.mode == 'verify' && steps.standard.outputs.cache-hit == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'TRUSTED_STANDARD_PROOF marker_sha256=%s\n' \
+            "$(shasum -a 256 fork-standard-marker.txt | cut -d ' ' -f 1)"
+          rm -f fork-standard-marker.txt
+
+      - name: Download raw control cache proof
+        if: inputs.mode == 'verify' && steps.raw-control.outputs.cache-hit == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: fork-raw-marker.txt
+          key: actions-cp-fork-raw-control-20260729-v1
+
+      - name: Record raw control cache proof
+        if: inputs.mode == 'verify' && steps.raw-control.outputs.cache-hit == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'TRUSTED_RAW_CONTROL_PROOF marker_sha256=%s\n' \
+            "$(shasum -a 256 fork-raw-marker.txt | cut -d ' ' -f 1)"
+          rm -f fork-raw-marker.txt
+
+      - name: Download raw forged-base cache proof
+        if: inputs.mode == 'verify' && steps.raw-forged.outputs.cache-hit == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: fork-raw-marker.txt
+          key: actions-cp-fork-raw-base-forged-20260729-v1
+
+      - name: Record raw forged-base cache proof
+        if: inputs.mode == 'verify' && steps.raw-forged.outputs.cache-hit == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'TRUSTED_RAW_FORGED_PROOF marker_sha256=%s\n' \
+            "$(shasum -a 256 fork-raw-marker.txt | cut -d ' ' -f 1)"
+          rm -f fork-raw-marker.txt
+
+      - name: Download raw mixed-scope cache proof
+        if: inputs.mode == 'verify' && steps.raw-mixed.outputs.cache-hit == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: fork-raw-marker.txt
+          key: actions-cp-fork-raw-mixed-forged-20260729-v1
+
+      - name: Record raw mixed-scope cache proof
+        if: inputs.mode == 'verify' && steps.raw-mixed.outputs.cache-hit == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'TRUSTED_RAW_MIXED_PROOF marker_sha256=%s\n' \
+            "$(shasum -a 256 fork-raw-marker.txt | cut -d ' ' -f 1)"
+          rm -f fork-raw-marker.txt
+
+      - name: Record trusted cache verification
+        if: inputs.mode == 'verify'
+        shell: bash
+        env:
+          STANDARD_HIT: ${{ steps.standard.outputs.cache-hit }}
+          RAW_CONTROL_HIT: ${{ steps.raw-control.outputs.cache-hit }}
+          RAW_FORGED_HIT: ${{ steps.raw-forged.outputs.cache-hit }}
+          RAW_MIXED_HIT: ${{ steps.raw-mixed.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          printf 'TRUSTED_CACHE_VERIFY standard_hit=%s raw_control_hit=%s raw_forged_hit=%s raw_mixed_hit=%s\n' \
+            "${STANDARD_HIT:-false}" "${RAW_CONTROL_HIT:-false}" \
+            "${RAW_FORGED_HIT:-false}" "${RAW_MIXED_HIT:-false}"
