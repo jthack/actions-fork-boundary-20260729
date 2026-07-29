@@ -1,0 +1,12 @@
+name: merge-upstream contents boundary 20260729211125
+on:
+  push:
+    branches:
+      - main
+permissions:
+  contents: read
+jobs:
+  harmless:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo owned-harmless-merge-upstream-20260729211125
